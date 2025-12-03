@@ -8,7 +8,7 @@ Research tool for analyzing and modifying firmware parameters on Brightway-based
 
 - May void your warranty
 - May violate local laws and regulations
-- Creates serious safety risks by bypassing manufacturer safety features
+- Creates serious safety risks
 - Modified devices may be illegal to operate
 - You assume ALL liability for injuries, accidents, and legal consequences
 
@@ -45,7 +45,7 @@ pip install -r requirements.txt
 
 This tool can modify various firmware parameters. The specific parameters available depend on the device model and firmware version.
 
-**WARNING:** Modifying firmware parameters may bypass safety features, void warranties, and create legal liability. Users assume all responsibility.
+**WARNING:** Modifying firmware parameters may alter device behavior, void warranties, and create legal liability. Users assume all responsibility.
 
 ## Usage
 

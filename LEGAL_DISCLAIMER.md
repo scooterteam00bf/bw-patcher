@@ -19,7 +19,7 @@ By using this software, you acknowledge and agree that:
 - You will research and understand the legal implications in your specific location before use
 
 ### 2. Safety Risks
-- Modifying firmware can bypass manufacturer safety features
+- Modifying firmware can alter device behavior
 - Modified devices may be unsafe and unpredictable
 - You assume all risks associated with firmware modification
 - You are responsible for any injuries or property damage resulting from your use of modified firmware
@@ -49,7 +49,7 @@ By using this software, you acknowledge and agree that:
 While the Digital Millennium Copyright Act (DMCA) provides exemptions for vehicle repair and modification, **selling or distributing circumvention tools may violate federal law** under Section 1201(a)(2) anti-trafficking provisions. This software is provided for personal use only.
 
 ### Product Liability
-Creating or selling devices that bypass safety features may expose you to significant product liability claims if users are injured. Such modifications may result in liability exceeding insurance policy limits, putting personal assets at risk.
+Creating or selling modified devices may expose you to significant product liability claims if users are injured. Such modifications may result in liability exceeding insurance policy limits, putting personal assets at risk.
 
 ### Regulatory Compliance
 Operating modified devices may violate local regulations and may result in:
@@ -80,7 +80,7 @@ If you discover security vulnerabilities in manufacturer firmware, we encourage 
 
 The authors and contributors of this project:
 - Do not encourage or support illegal modifications
-- Do not provide support for bypassing safety features
+- Do not provide support for unsupported modifications
 - Will not assist with commercial exploitation
 - Reserve the right to refuse support to anyone using this software for illegal purposes
 
