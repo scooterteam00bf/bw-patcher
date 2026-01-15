@@ -76,4 +76,5 @@ class Mi4pro2ndPatcher(ES32Patcher):
         return res
 
     def remove_speed_limit_sport(self):
-        return self.speed_limit_sport(speed=36.7)
+        return self.speed_limit_sport(speed=45.7)
+
