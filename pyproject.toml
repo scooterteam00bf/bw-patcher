@@ -15,6 +15,9 @@ streamlit = "^1.40.1"
 setuptools = "^80.9.0"
 streamlit-scroll-to-top = "^0.0.4"
 
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
