@@ -6,6 +6,14 @@ from streamlit_scroll_to_top import scroll_to_here
 
 
 LEQI_MODELS = ["mi5elite", "mi6", "mi6lite"]
+EXPERIMENTAL_MODELS = ["mi6", "mi6lite"]
+# Base/shared modules that must never appear in the model picker
+_NON_MODEL_MODULES = {"leqi_speed"}
+
+STABLE_MODULES = [
+    m for m in ALL_MODULES
+    if m not in EXPERIMENTAL_MODELS and m not in _NON_MODEL_MODULES
+]
 
 
 title = "Brightway Firmware Patcher"
@@ -139,12 +147,28 @@ uploaded_file = st.file_uploader(
 # Advanced option for full dump vs DFU firmware
 advanced_mode = st.checkbox('⚡ Advanced: I\'m patching a full dump (not DFU firmware)')
 
+# Hidden unlock: ?experimental=1 in the URL, or the checkbox below when advanced is on
+experimental_qp = str(st.query_params.get("experimental", "")).lower() in ("1", "true", "yes")
+experimental_mode = experimental_qp
+if advanced_mode:
+    experimental_mode = st.checkbox(
+        "🧪 Experimental models (mi6 / mi6lite)",
+        value=experimental_qp,
+        help="Unreleased patchers. Use at your own risk.",
+    )
+
+available_models = list(STABLE_MODULES)
+if experimental_mode:
+    available_models = sorted(set(available_models) | set(EXPERIMENTAL_MODELS))
 
 st.subheader("🛴 Scooter Model")
 scooter_model = st.selectbox(
     "Select your model",
-    ALL_MODULES
+    available_models
 )
+
+if experimental_mode and scooter_model in EXPERIMENTAL_MODELS:
+    st.warning("Experimental model selected — patches may be incomplete or untested.")
 
 if uploaded_file and scooter_model:
     st.success(f"Ready to configure patches for {scooter_model}")
