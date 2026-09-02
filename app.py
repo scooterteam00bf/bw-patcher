@@ -5,6 +5,12 @@ import streamlit as st
 from streamlit_scroll_to_top import scroll_to_here
 
 
+LEQI_MODELS = ["mi5elite", "mi6", "mi6lite"]
+EXPERIMENTAL_MODELS = ["mi6", "mi6lite"]
+
+STABLE_MODULES = [m for m in ALL_MODULES if m not in EXPERIMENTAL_MODELS]
+
+
 title = "Brightway Firmware Patcher"
 st.set_page_config(
     page_title=title,
@@ -136,12 +142,21 @@ uploaded_file = st.file_uploader(
 # Advanced option for full dump vs DFU firmware
 advanced_mode = st.checkbox('⚡ Advanced: I\'m patching a full dump (not DFU firmware)')
 
+# Hidden unlock: ?experimental=1
+experimental_mode = str(st.query_params.get("experimental", "")).lower() in ("1", "true", "yes")
+
+available_models = list(STABLE_MODULES)
+if experimental_mode:
+    available_models = sorted(set(available_models) | set(EXPERIMENTAL_MODELS))
 
 st.subheader("🛴 Scooter Model")
 scooter_model = st.selectbox(
     "Select your model",
-    ALL_MODULES
+    available_models
 )
+
+if experimental_mode and scooter_model in EXPERIMENTAL_MODELS:
+    st.warning("Experimental model selected — patches may be incomplete or untested.")
 
 if uploaded_file and scooter_model:
     st.success(f"Ready to configure patches for {scooter_model}")
@@ -162,7 +177,7 @@ if st.checkbox('Speed Limit Drive (SLD)'):
     sld_speed = st.slider("Max Speed (SLD)", 1.0, 35.0, 15.0, 0.1)
     patches.append(f'sld={sld_speed}')
 
-if scooter_model in ['mi5elite']:
+if scooter_model in LEQI_MODELS:
     if st.checkbox('Speed Limit Pedestrian (SLP)'):
         slp_speed = st.slider("Max Speed (SLP)", 1.0, 35.0, 6.0, 0.1)
         patches.append(f'slp={slp_speed}')
@@ -172,17 +187,17 @@ if scooter_model in ['mi4', 'ultra4']:
         dms_speed = st.slider("Max Speed (DMS)", 1.0, 29.6, 22.0, 0.1)
         patches.append(f'dms={dms_speed}')
 
-if scooter_model not in ["mi4pro2nd", "mi5pro", "mi5elite"]:
+if scooter_model not in ["mi4pro2nd", "mi5pro", *LEQI_MODELS]:
     if st.checkbox('Fake Firmware Version (FDV)'):
         fdv_version = st.text_input("Firmware Version (4 digits)", value="0000", max_chars=4)
         if len(fdv_version) == 4 and fdv_version.isdigit():
             patches.append(f"fdv={fdv_version}")
 
-if scooter_model not in ["mi5elite"]:
+if scooter_model not in LEQI_MODELS:
     if st.checkbox('Cruise Control Enable (CCE)'):
         patches.append("cce")
 
-if scooter_model not in ["mi4", "mi4lite"]:
+if scooter_model not in ["mi4", "mi4lite", "mi6", "mi6lite"]:
     if st.checkbox('Motor Start Speed (MSS)'):
         mss_speed = st.slider("Motor Start Speed (MSS)", 1.0, 9.0, 5.0, 0.1)
         patches.append(f"mss={mss_speed}")
@@ -200,7 +215,7 @@ if uploaded_file is not None and patches:
     if not advanced_mode and patches[-1] != "chk":
         patches.append("chk")
 
-    if scooter_model in ["mi5elite"]:
+    if scooter_model in LEQI_MODELS:
         patches.append("img")
 
     # Process button

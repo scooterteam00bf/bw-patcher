@@ -34,7 +34,17 @@ class CoreN32Patcher(CorePatcher):
 
     # Image format constants
     FIRMWARE_OFFSET = 0x80      # Firmware starts at offset 128 in full image
-    FIRMWARE_SIZE = 0x9880      # Expected firmware size (39040 bytes)
+    FIRMWARE_SIZE = 0x9880      # Legacy/fallback firmware size, only used when the
+                                 # header size field (see below) can't be read
+
+    # Full-image header layout: an "EU1\x00" ASCII tag is followed immediately by a
+    # little-endian uint16 giving the exact size of the encrypted firmware body that
+    # starts at FIRMWARE_OFFSET. This size varies per firmware/model, so it must be
+    # read from the header rather than assumed to be a fixed per-model constant - see
+    # docs/20-dynamic-firmware-size-detection.md for how this was discovered/verified.
+    HEADER_TAG = b'EU1\x00'
+    HEADER_TAG_OFFSET = 0x0A
+    HEADER_SIZE_FIELD_OFFSET = 0x0E
 
     # CRC calculation constants
     CRC_START_OFFSET = 0x40     # CRC calculated from this offset
@@ -57,8 +67,11 @@ class CoreN32Patcher(CorePatcher):
 
         firmware_data = data
 
-        # Extract firmware from full image if present
-        if len(data) >= self.FIRMWARE_OFFSET + self.FIRMWARE_SIZE:
+        # Extract firmware from full image if present. Prefer the header's own size
+        # field (authoritative, varies per model) over the fallback FIRMWARE_SIZE
+        # constant when deciding whether this is a full image at all.
+        header_size = self.parse_header_firmware_size(data)
+        if header_size is not None or len(data) >= self.FIRMWARE_OFFSET + self.FIRMWARE_SIZE:
             firmware_data, self.image_header, self.image_footer = self.extract_firmware_from_image(data)
 
         # Detect encryption and decrypt if needed
@@ -67,6 +80,56 @@ class CoreN32Patcher(CorePatcher):
             firmware_data = self.decrypt_data(firmware_data)
 
         super().__init__(firmware_data)
+
+    @classmethod
+    def _read_header_size_field(cls, header_data: bytes) -> Optional[int]:
+        """
+        Read the EU1 tag's size field from a buffer, without bounds-checking the
+        result against any particular total image length.
+
+        Shared by parse_header_firmware_size (checks the field fits within a full
+        image) and insert_firmware_into_image (checks it against a standalone
+        header slice, which is by definition smaller than the full image).
+
+        Returns:
+            int: The raw size value if the tag is present and the value looks
+                 plausible, otherwise None.
+        """
+        if len(header_data) < cls.HEADER_SIZE_FIELD_OFFSET + 2:
+            return None
+
+        tag = header_data[cls.HEADER_TAG_OFFSET:cls.HEADER_TAG_OFFSET + len(cls.HEADER_TAG)]
+        if tag != cls.HEADER_TAG:
+            return None
+
+        size = struct.unpack_from('<H', header_data, cls.HEADER_SIZE_FIELD_OFFSET)[0]
+        if size < 0x400:
+            return None
+
+        return size
+
+    @classmethod
+    def parse_header_firmware_size(cls, full_image_data: bytes) -> Optional[int]:
+        """
+        Read the authoritative encrypted-firmware-body size from a full image header.
+
+        The header contains an ASCII tag ("EU1\\x00") at HEADER_TAG_OFFSET, immediately
+        followed by a little-endian uint16 at HEADER_SIZE_FIELD_OFFSET holding the exact
+        size (in bytes) of the encrypted firmware body located at FIRMWARE_OFFSET.
+
+        Returns:
+            int: The firmware body size if the header tag is present and the size looks
+                 plausible (fits within the given buffer), otherwise None.
+        """
+        size = cls._read_header_size_field(full_image_data)
+        if size is None:
+            return None
+
+        # Sanity check: body must actually fit within the image
+        if cls.FIRMWARE_OFFSET + size > len(full_image_data):
+            return None
+
+        return size
 
     def fix_checksum(self, start_ofs: Optional[int] = None) -> Tuple[str, str, str, str]:
         """
@@ -340,6 +403,13 @@ class CoreN32Patcher(CorePatcher):
         """
         Extract firmware section from full image file.
 
+        Uses the size encoded in the image header when available (see
+        parse_header_firmware_size), falling back to the legacy fixed-size window
+        (FIRMWARE_SIZE) only when the header can't be read. This avoids the bug where
+        a per-model FIRMWARE_SIZE constant that's even slightly wrong silently pulls
+        in bytes from beyond the real firmware body (see
+        docs/20-dynamic-firmware-size-detection.md).
+
         Args:
             full_image_data: Full image data
 
@@ -349,18 +419,22 @@ class CoreN32Patcher(CorePatcher):
         Raises:
             ValueError: If image is too small
         """
-        if len(full_image_data) == cls.FIRMWARE_SIZE:
+        body_size = cls.parse_header_firmware_size(full_image_data)
+        if body_size is None:
+            body_size = cls.FIRMWARE_SIZE
+
+        if len(full_image_data) == body_size:
             return (full_image_data, bytes(), bytes())
 
-        if len(full_image_data) < cls.FIRMWARE_OFFSET + cls.FIRMWARE_SIZE:
+        if len(full_image_data) < cls.FIRMWARE_OFFSET + body_size:
             raise ValueError(
                 f"Image too small: {len(full_image_data)} bytes, "
-                f"expected at least {cls.FIRMWARE_OFFSET + cls.FIRMWARE_SIZE} bytes"
+                f"expected at least {cls.FIRMWARE_OFFSET + body_size} bytes"
             )
 
         image_header = full_image_data[:cls.FIRMWARE_OFFSET]
-        firmware_data = full_image_data[cls.FIRMWARE_OFFSET:cls.FIRMWARE_OFFSET + cls.FIRMWARE_SIZE]
-        image_footer = full_image_data[cls.FIRMWARE_OFFSET + cls.FIRMWARE_SIZE:]
+        firmware_data = full_image_data[cls.FIRMWARE_OFFSET:cls.FIRMWARE_OFFSET + body_size]
+        image_footer = full_image_data[cls.FIRMWARE_OFFSET + body_size:]
 
         return (firmware_data, image_header, image_footer)
 
@@ -369,6 +443,12 @@ class CoreN32Patcher(CorePatcher):
                                    image_footer: bytes) -> bytearray:
         """
         Insert patched firmware back into full image structure.
+
+        Validates firmware_data's length against the size encoded in image_header's
+        own EU1 tag when present (the same authoritative source extract_firmware_from_image
+        used to slice it out), falling back to the legacy FIRMWARE_SIZE constant
+        otherwise - mirrors the dynamic-size logic in extract_firmware_from_image so
+        insertion accepts exactly what a matching extraction would have produced.
 
         Args:
             firmware_data: Patched firmware data
@@ -381,10 +461,14 @@ class CoreN32Patcher(CorePatcher):
         Raises:
             ValueError: If firmware or header size doesn't match expected values
         """
-        if len(firmware_data) != cls.FIRMWARE_SIZE:
+        expected_size = cls._read_header_size_field(image_header)
+        if expected_size is None:
+            expected_size = cls.FIRMWARE_SIZE
+
+        if len(firmware_data) != expected_size:
             raise ValueError(
                 f"Firmware size mismatch: {len(firmware_data)} bytes, "
-                f"expected {cls.FIRMWARE_SIZE} bytes"
+                f"expected {expected_size} bytes"
             )
 
         if len(image_header) != cls.FIRMWARE_OFFSET:

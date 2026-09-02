@@ -163,6 +163,9 @@ cython_debug/
 # Debug directory
 debug/
 
+# Local firmware test fixtures
+tests/data/*.bin
+
 # IDE-specific
 .vscode/
 .idea/
