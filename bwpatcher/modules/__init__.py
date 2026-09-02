@@ -33,4 +33,9 @@ def _get_all_modules():
     ]
 
 
-ALL_MODULES = sorted(_get_all_modules())
+# Shared base modules — not selectable scooter models
+NON_MODEL_MODULES = frozenset({"leqi_speed"})
+
+ALL_MODULES = sorted(
+    m for m in _get_all_modules() if m not in NON_MODEL_MODULES
+)

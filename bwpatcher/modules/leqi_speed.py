@@ -29,15 +29,86 @@ class LeqiSpeedPatcher(CoreN32Patcher):
 
     MODE_ORDER = ('ped', 'drive', 'sport')
 
+    # UART regional cap in 0.1 km/h units (35 km/h, same as Elite SPECIAL/Standard).
+    REGION_LIMIT_VALUE = 0x15E
+
     def __init__(self, data: bytes):
         super().__init__(data)
         self.patched_speeds: Dict[str, int] = {}
         self._speed_block_patched = False
         self._inject_offset: Optional[int] = None
+        self._hijack_offset: Optional[int] = None
+        self._return_address: Optional[int] = None
+        self._output_ptr: Optional[int] = None
+        self._region_limit_patch_ofs: Optional[int] = None
+        self._region_limit_store_ofs: Optional[int] = None
 
     def _speed_limit_fix(self) -> List[Tuple[str, str, str, str]]:
         """Regional bypass hook; default no-op for variants without it."""
         return []
+
+    def _resolve_region_limit_sites(
+        self,
+        anchor: List[Optional[int]],
+        stock_patch: List[int],
+    ) -> Tuple[int, int]:
+        if self._region_limit_patch_ofs is not None:
+            assert self._region_limit_store_ofs is not None
+            return self._region_limit_patch_ofs, self._region_limit_store_ofs
+
+        sig_ofs = find_pattern(self.data, anchor)
+        try:
+            patch_slot = next(i for i, byte in enumerate(anchor) if byte is None)
+        except StopIteration as exc:
+            raise Exception("Region limit anchor has no patch-slot wildcards") from exc
+
+        patch_len = sum(1 for byte in anchor if byte is None)
+        if patch_len != len(stock_patch):
+            raise Exception(
+                f"Region limit stock patch length {len(stock_patch)} "
+                f"does not match anchor wildcards ({patch_len})"
+            )
+
+        patch_ofs = sig_ofs + patch_slot
+        store_ofs = sig_ofs + len(anchor) - 2
+        self._region_limit_patch_ofs = patch_ofs
+        self._region_limit_store_ofs = store_ofs
+        return patch_ofs, store_ofs
+
+    def _apply_region_limit_movw_branch(
+        self,
+        anchor: List[Optional[int]],
+        stock_patch: List[int],
+        reg: str,
+        patch_name: str,
+    ) -> List[Tuple[str, str, str, str]]:
+        value = self.REGION_LIMIT_VALUE
+
+        try:
+            patch_ofs, store_ofs = self._resolve_region_limit_sites(anchor, stock_patch)
+        except SignatureException:
+            return []
+
+        asm = f"movw {reg}, #{hex(value)}\nb {hex(store_ofs)}"
+        post = self.assembly(asm, patch_ofs)
+        if len(post) != len(stock_patch):
+            raise Exception(
+                f"Region limit patch @0x{patch_ofs:X}: expected {len(stock_patch)} bytes, "
+                f"got {len(post)}"
+            )
+
+        pre = bytes(self.data[patch_ofs:patch_ofs + len(post)])
+        if pre == post:
+            return []
+
+        stock = bytes(stock_patch)
+        if pre == stock:
+            self.data[patch_ofs:patch_ofs + len(post)] = post
+            return [(patch_name, hex(patch_ofs), pre.hex(), post.hex())]
+
+        raise Exception(
+            f"Region limit patch @0x{patch_ofs:X}: expected {stock.hex()}, found {pre.hex()}"
+        )
 
     def _locate_patch_offsets(self) -> None:
         raise NotImplementedError
@@ -157,6 +228,75 @@ class LeqiSpeedPatcher(CoreN32Patcher):
                 f"({size} bytes required)"
             )
 
+    def _read_ldr_pc_literal(self, insn_offset: int) -> int:
+        """Decode a 16-bit Thumb `ldr Rt, [pc, #imm]` and read its literal pool word."""
+        insn = self.data[insn_offset:insn_offset + 2]
+        if len(insn) != 2:
+            raise Exception(f"ldr @0x{insn_offset:X}: truncated instruction")
+
+        hw = insn[0] | (insn[1] << 8)
+        imm = (hw & 0xFF) * 4
+        pc = (insn_offset + 4) & ~3
+        literal_addr = pc + imm
+        if literal_addr + 4 > len(self.data):
+            raise Exception(
+                f"ldr @0x{insn_offset:X}: literal pool @0x{literal_addr:X} out of range"
+            )
+        return struct.unpack_from('<I', self.data, literal_addr)[0]
+
+    def _find_tail_zero_padding(self, min_size: int, search_window: int = 0x800) -> int:
+        """Locate the largest zero run in the firmware tail (inject padding)."""
+        search_from = max(0, len(self.data) - search_window)
+        best_start: Optional[int] = None
+        best_len = 0
+
+        offset = search_from
+        while offset < len(self.data):
+            if self.data[offset] != 0:
+                offset += 1
+                continue
+
+            run_end = offset
+            while run_end < len(self.data) and self.data[run_end] == 0:
+                run_end += 1
+            run_len = run_end - offset
+            if run_len >= min_size and run_len > best_len:
+                best_start = offset
+                best_len = run_len
+            offset = run_end
+
+        if best_start is None:
+            raise Exception(
+                f"No zero padding >= {min_size} bytes found in last 0x{search_window:X} bytes"
+            )
+        return best_start
+
+    def _resolve_speed_padding_sites(
+        self,
+        anchor: List[int],
+        hijack_size: int,
+        output_ptr_ldr_offset: int,
+        min_padding_size: int,
+    ) -> None:
+        if self._hijack_offset is not None:
+            assert self._inject_offset is not None
+            assert self._return_address is not None
+            assert self._output_ptr is not None
+            return
+
+        sig_ofs = find_pattern(self.data, anchor)
+        if hijack_size > len(anchor):
+            raise Exception(
+                f"Speed calc hijack size {hijack_size} exceeds anchor length {len(anchor)}"
+            )
+        if output_ptr_ldr_offset + 2 > len(anchor):
+            raise Exception("output_ptr_ldr_offset must fall within speed calc anchor")
+
+        self._hijack_offset = sig_ofs
+        self._return_address = sig_ofs + len(anchor)
+        self._output_ptr = self._read_ldr_pc_literal(sig_ofs + output_ptr_ldr_offset)
+        self._inject_offset = self._find_tail_zero_padding(min_padding_size)
+
     def _apply_bw_hijack(
         self,
         hijack_offset: int,
@@ -213,31 +353,47 @@ class LeqiPaddingSpeedPatcher(LeqiSpeedPatcher):
     """
     Leqi speed patcher using verified-zero padding for injected code (mi6, mi6lite).
 
-    Hijacks a 4-byte instruction run with b.w into the padding region.
+    Hijacks a 4-byte instruction run with b.w into tail zero padding. Hijack,
+    return, output pointer, and inject sites are resolved via pattern matching.
     """
 
-    SIG_HIJACK: List[int]
-    HIJACK_OFFSET: int
-    INJECT_OFFSET: int
-    RETURN_ADDRESS: int
-    OUTPUT_PTR: int = 0x200001A2
+    SIG_SPEED_CALC_ANCHOR: List[int]
+    HIJACK_SIZE: int = 4
+    OUTPUT_PTR_LDR_OFFSET: int
     MIN_PADDING_SIZE: int = 64
+    TAIL_SEARCH_WINDOW: int = 0x800
 
     def _locate_patch_offsets(self) -> None:
-        self._inject_offset = self.INJECT_OFFSET
+        try:
+            self._resolve_speed_padding_sites(
+                self.SIG_SPEED_CALC_ANCHOR,
+                self.HIJACK_SIZE,
+                self.OUTPUT_PTR_LDR_OFFSET,
+                self.MIN_PADDING_SIZE,
+            )
+        except SignatureException as exc:
+            raise Exception("Could not find speed calc signature for patching") from exc
 
     def _apply_hijack_patch(self) -> Tuple[str, str, str, str]:
+        assert self._hijack_offset is not None
+        assert self._inject_offset is not None
         return self._apply_bw_hijack(
-            self.HIJACK_OFFSET,
-            self.INJECT_OFFSET,
-            self.SIG_HIJACK,
+            self._hijack_offset,
+            self._inject_offset,
+            self.SIG_SPEED_CALC_ANCHOR[:self.HIJACK_SIZE],
         )
 
     def _verify_inject_site(self, patch_bytes: bytes) -> None:
-        self._verify_zero_padding(self.INJECT_OFFSET, max(len(patch_bytes), self.MIN_PADDING_SIZE))
+        assert self._inject_offset is not None
+        self._verify_zero_padding(
+            self._inject_offset,
+            max(len(patch_bytes), self.MIN_PADDING_SIZE),
+        )
 
     def _assemble_inject_block(self, asm_code: str) -> bytes:
+        assert self._inject_offset is not None
+        assert self._output_ptr is not None
         return self._assemble_with_literal_pool(
-            asm_code, self._inject_offset, self.OUTPUT_PTR
+            asm_code, self._inject_offset, self._output_ptr
         )
 
