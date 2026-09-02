@@ -23,22 +23,13 @@ import glob
 from os.path import dirname, basename, isfile
 
 
-# Modules present on disk but not exposed via CLI/UI
-DISABLED_MODULES = {
-    "ultra4",
-}
-
-
 # Get all modules to import from directory
 # https://stackoverflow.com/a/47473360
 def _get_all_modules():
     mod_paths = glob.glob(dirname(__file__) + '/*.py')
     return [
         basename(f)[:-3] for f in mod_paths
-        if isfile(f)
-        and f.endswith('.py')
-        and not f.endswith('__init__.py')
-        and basename(f)[:-3] not in DISABLED_MODULES
+        if isfile(f) and f.endswith('.py') and not f.endswith('__init__.py')
     ]
 
 
