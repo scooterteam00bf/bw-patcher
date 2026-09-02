@@ -9,6 +9,9 @@ from bwpatcher.modules.mi6 import Mi6Patcher
 FIRMWARE_BODY_SIZE = 0xA800
 REAL_FIRMWARE = Path(__file__).resolve().parents[1] / "bins" / "6.dec.bin"
 REGION_LIMIT_TEST_OFFSET = 0x8000
+REGION_GATE_WILDCARD_BYTES = list(Mi6Patcher.STOCK_REGION_LIMIT_GATE)
+EXPECTED_REGION_JUMPTABLE = Mi6Patcher.REGION_JUMPTABLE_PATCH
+EXPECTED_REGION_MOVW = bytes.fromhex("40f25e12")
 
 
 def _embed_bytes(data: bytearray, offset: int, pattern: list) -> None:
@@ -17,11 +20,10 @@ def _embed_bytes(data: bytearray, offset: int, pattern: list) -> None:
 
 
 def _embed_region_limit_anchor(data: bytearray, offset: int) -> None:
-    stock = Mi6Patcher.STOCK_REGION_LIMIT_PATCH
     patch_i = 0
     for byte in Mi6Patcher.SIG_REGION_LIMIT_ANCHOR:
         if byte is None:
-            data[offset] = stock[patch_i]
+            data[offset] = REGION_GATE_WILDCARD_BYTES[patch_i]
             patch_i += 1
         else:
             data[offset] = byte
@@ -40,7 +42,8 @@ def _make_firmware_buffer():
         tail[zero_run_start:] = b"\x00" * (len(tail) - zero_run_start)
         data[-Mi6Patcher.TAIL_SEARCH_WINDOW:] = tail
 
-    _embed_region_limit_anchor(data, REGION_LIMIT_TEST_OFFSET)
+    if not REAL_FIRMWARE.is_file():
+        _embed_region_limit_anchor(data, REGION_LIMIT_TEST_OFFSET)
     return data
 
 
@@ -49,13 +52,19 @@ class TestMi6Patcher:
         if not REAL_FIRMWARE.is_file():
             pytest.skip("bins/6.dec.bin not available")
 
-        patcher = Mi6Patcher(bytearray(REAL_FIRMWARE.read_bytes()))
+        stock = REAL_FIRMWARE.read_bytes()
+        patcher = Mi6Patcher(bytearray(stock))
         results = patcher.speed_limit_sport(30)
         patches = {r[0]: r for r in results}
+        patched = bytes(patcher.data)
 
         assert patches["hijack_speed_calc"][1] == "0x2a68"
         assert patches["speed_logic_block"][1] == "0xa40e"
-        assert patches["region_limit_special"][3] == "40f25e1209e0"
+        assert patches["region_limit_jumptable"][3] == EXPECTED_REGION_JUMPTABLE.hex()
+        assert patches["region_limit_movw"][3] == "5e"
+        assert patched[0x2E28:0x2E2D] == EXPECTED_REGION_JUMPTABLE
+        assert patched[0x2E32:0x2E36] == EXPECTED_REGION_MOVW
+        assert patched[0x2E1C:0x2E22] == stock[0x2E1C:0x2E22]
 
     def test_speed_limit_sport_matches_resolved_sites(self):
         patcher = Mi6Patcher(_make_firmware_buffer())
@@ -63,7 +72,8 @@ class TestMi6Patcher:
         patches = {r[0]: r for r in results}
 
         assert patches["hijack_speed_calc"][1] == "0x2a68"
-        assert patches["region_limit_special"][3] == "40f25e1209e0"  # movw r2, #0x15E = 35 km/h
+        assert patches["region_limit_jumptable"][3] == EXPECTED_REGION_JUMPTABLE.hex()
+        assert patches["region_limit_movw"][3] == "5e"
         assert patches["speed_logic_block"][1] == hex(patcher._inject_offset)
 
     def test_speed_limit_drive_updates_constants(self):
