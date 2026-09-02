@@ -6,7 +6,7 @@ from streamlit_scroll_to_top import scroll_to_here
 
 
 LEQI_MODELS = ["mi5elite", "mi6", "mi6lite"]
-EXPERIMENTAL_MODELS = ["mi6", "mi6lite"]
+EXPERIMENTAL_MODELS = ["mi6", "mi6lite", "ultra4"]
 
 STABLE_MODULES = [m for m in ALL_MODULES if m not in EXPERIMENTAL_MODELS]
 
