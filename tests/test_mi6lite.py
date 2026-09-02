@@ -8,7 +8,13 @@ from bwpatcher.modules.mi6lite import Mi6litePatcher
 
 FIRMWARE_BODY_SIZE = 0xB000
 REAL_FIRMWARE = Path(__file__).resolve().parents[1] / "bins" / "6lite.dec.bin"
+V2_FIRMWARE = Path(__file__).resolve().parents[1] / "patched_mi6lite_firmware_v2.dec.bin"
 REGION_LIMIT_TEST_OFFSET = 0x8000
+REGION_ANCHOR_WILDCARD_BYTES = [0x62, 0x45, 0x0C, 0xD0, 0x04, 0xDC]
+EXPECTED_REGION_V2 = bytes.fromhex(
+    "62450ce004dcd1180bd001290cd106e0012804d0a0f580711f3905d101e0cf2100bf40f25e113980"
+)
+INJECT_PROLOGUE = bytes.fromhex("48798a7802f00302")
 
 
 def _embed_bytes(data: bytearray, offset: int, pattern: list) -> None:
@@ -17,11 +23,10 @@ def _embed_bytes(data: bytearray, offset: int, pattern: list) -> None:
 
 
 def _embed_region_limit_anchor(data: bytearray, offset: int) -> None:
-    stock = Mi6litePatcher.STOCK_REGION_LIMIT_PATCH
     patch_i = 0
     for byte in Mi6litePatcher.SIG_REGION_LIMIT_ANCHOR:
         if byte is None:
-            data[offset] = stock[patch_i]
+            data[offset] = REGION_ANCHOR_WILDCARD_BYTES[patch_i]
             patch_i += 1
         else:
             data[offset] = byte
@@ -40,7 +45,8 @@ def _make_firmware_buffer():
         tail[zero_run_start:] = b"\x00" * (len(tail) - zero_run_start)
         data[-Mi6litePatcher.TAIL_SEARCH_WINDOW:] = tail
 
-    _embed_region_limit_anchor(data, REGION_LIMIT_TEST_OFFSET)
+    if not REAL_FIRMWARE.is_file():
+        _embed_region_limit_anchor(data, REGION_LIMIT_TEST_OFFSET)
     return data
 
 
@@ -54,8 +60,28 @@ class TestMi6litePatcher:
         patches = {r[0]: r for r in results}
 
         assert patches["hijack_speed_calc"][1] == "0x2dea"
-        assert patches["speed_logic_block"][1] == "0xac48"
-        assert patches["region_limit_gl"][3] == "40f25e110fe0"
+        assert patches["hijack_speed_calc"][3] == "07f031bf"
+        assert patches["speed_logic_block"][1] == "0xac50"
+        assert patches["region_limit_bypass"][3] == "0ce0"
+        assert patches["region_limit_nop"][3] == "00bf"
+        assert patches["region_limit_movw"][3] == "5e"
+
+    def test_v2_region_and_hijack_bytes(self):
+        if not REAL_FIRMWARE.is_file() or not V2_FIRMWARE.is_file():
+            pytest.skip("reference firmware bins not available")
+
+        patcher = Mi6litePatcher(bytearray(REAL_FIRMWARE.read_bytes()))
+        patcher.speed_limit_ped(25)
+        patcher.speed_limit_drive(30)
+        patcher.speed_limit_sport(35)
+        patched = bytes(patcher.data)
+        v2_body = V2_FIRMWARE.read_bytes()[0x80:0x80 + len(patched)]
+
+        assert patched[0x2DEA:0x2DEE] == bytes.fromhex("07f031bf")
+        assert patched[0x3228:0x3250] == EXPECTED_REGION_V2
+        assert patched[0x3228:0x3250] == v2_body[0x3228:0x3250]
+        assert patched[0xAC50:0xAC90] == v2_body[0xAC50:0xAC90]
+        assert patched[0xAC50:0xAC58] == INJECT_PROLOGUE
 
     def test_speed_limit_sport_matches_resolved_sites(self):
         patcher = Mi6litePatcher(_make_firmware_buffer())
@@ -63,7 +89,8 @@ class TestMi6litePatcher:
         patches = {r[0]: r for r in results}
 
         assert patches["hijack_speed_calc"][1] == "0x2dea"
-        assert patches["region_limit_gl"][3] == "40f25e110fe0"  # movw r1, #0x15E = 35 km/h
+        assert patches["region_limit_bypass"][3] == "0ce0"
+        assert patches["region_limit_movw"][3] == "5e"
         assert patches["speed_logic_block"][1] == hex(patcher._inject_offset)
 
     def test_speed_limit_drive_updates_constants(self):
@@ -97,12 +124,7 @@ class TestMi6litePatcher:
     def test_nonzero_padding_raises(self):
         data = _make_firmware_buffer()
         probe = Mi6litePatcher(data)
-        probe._resolve_speed_padding_sites(
-            Mi6litePatcher.SIG_SPEED_CALC_ANCHOR,
-            Mi6litePatcher.HIJACK_SIZE,
-            Mi6litePatcher.OUTPUT_PTR_LDR_OFFSET,
-            Mi6litePatcher.MIN_PADDING_SIZE,
-        )
+        probe._locate_patch_offsets()
         inject_ofs = probe._inject_offset
         run_end = inject_ofs
         while run_end < len(data) and data[run_end] == 0:
