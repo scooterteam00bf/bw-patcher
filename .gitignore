@@ -166,6 +166,10 @@ debug/
 # Local firmware test fixtures
 tests/data/*.bin
 
+# Local-only helpers and tests
+scripts/leqi_fw_tool.py
+tests/
+
 # IDE-specific
 .vscode/
 .idea/
