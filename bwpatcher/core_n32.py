@@ -64,6 +64,7 @@ class CoreN32Patcher(CorePatcher):
         self.verbose = False
         self.image_header: Optional[bytes] = None
         self.image_footer: Optional[bytes] = None
+        self.header_firmware_size: Optional[int] = None
 
         firmware_data = data
 
@@ -71,6 +72,7 @@ class CoreN32Patcher(CorePatcher):
         # field (authoritative, varies per model) over the fallback FIRMWARE_SIZE
         # constant when deciding whether this is a full image at all.
         header_size = self.parse_header_firmware_size(data)
+        self.header_firmware_size = header_size
         if header_size is not None or len(data) >= self.FIRMWARE_OFFSET + self.FIRMWARE_SIZE:
             firmware_data, self.image_header, self.image_footer = self.extract_firmware_from_image(data)
 
@@ -239,17 +241,21 @@ class CoreN32Patcher(CorePatcher):
 
     def calculate_firmware_size(self, firmware_data: bytes) -> int:
         """
-        Calculate firmware size by detecting padding sequence end.
-
-        Finds the longest consecutive padding sequence (0xAA encrypted or 0x00 decrypted)
-        and rounds up to the nearest 128-byte boundary.
+        Calculate firmware size, preferring the EU1 header size field when available,
+        falling back to padding sequence detection.
 
         Args:
             firmware_data: Firmware data to analyze
 
         Returns:
-            Calculated firmware size aligned to 128-byte boundary
+            Firmware size (from header or aligned to 128-byte boundary)
         """
+        header_size = getattr(self, "header_firmware_size", None)
+        if header_size is not None:
+            if getattr(self, "verbose", False):
+                print(f"Using header firmware size: 0x{header_size:X}")
+            return header_size
+
         data = bytes(firmware_data)
         max_padding_length = 0
         max_padding_end = 0
