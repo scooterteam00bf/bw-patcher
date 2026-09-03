@@ -156,7 +156,11 @@ scooter_model = st.selectbox(
 )
 
 if experimental_mode and scooter_model in EXPERIMENTAL_MODELS:
-    st.warning("Experimental model selected — patches may be incomplete or untested.")
+    st.warning(
+        "Experimental model selected — patches may be incomplete or untested. "
+        "There is no guarantee of correct behavior; flashing can brick your scooter. "
+        "Proceed only if you accept that risk."
+    )
 
 if uploaded_file and scooter_model:
     st.success(f"Ready to configure patches for {scooter_model}")
