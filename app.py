@@ -5,8 +5,8 @@ import streamlit as st
 from streamlit_scroll_to_top import scroll_to_here
 
 
-LEQI_MODELS = ["mi5elite", "mi6", "mi6lite"]
-EXPERIMENTAL_MODELS = ["mi6", "mi6lite", "ultra4"]
+LEQI_MODELS = ["mi5elite", "mi6", "mi6lite", "mi5plus"]
+EXPERIMENTAL_MODELS = ["mi6", "mi6lite", "ultra4", "mi5plus"]
 
 STABLE_MODULES = [m for m in ALL_MODULES if m not in EXPERIMENTAL_MODELS]
 
@@ -201,7 +201,7 @@ if scooter_model not in LEQI_MODELS:
     if st.checkbox('Cruise Control Enable (CCE)'):
         patches.append("cce")
 
-if scooter_model not in ["mi4", "mi4lite", "mi6", "mi6lite"]:
+if scooter_model not in ["mi4", "mi4lite", "mi6", "mi6lite", "mi5plus"]:
     if st.checkbox('Motor Start Speed (MSS)'):
         mss_speed = st.slider("Motor Start Speed (MSS)", 1.0, 9.0, 5.0, 0.1)
         patches.append(f"mss={mss_speed}")
