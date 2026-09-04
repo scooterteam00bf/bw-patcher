@@ -244,32 +244,63 @@ class LeqiSpeedPatcher(CoreN32Patcher):
             )
         return struct.unpack_from('<I', self.data, literal_addr)[0]
 
-    def _find_tail_zero_padding(self, min_size: int, search_window: int = 0x800) -> int:
-        """Locate the largest zero run in the firmware tail (inject padding)."""
-        search_from = max(0, len(self.data) - search_window)
-        best_start: Optional[int] = None
-        best_len = 0
+    def _find_tail_zero_padding(
+        self,
+        min_size: int,
+        search_from: Optional[int] = None,
+        search_window: Optional[int] = None,
+        pad_marker: Optional[List[int]] = None,
+    ) -> int:
+        """
+        Locate inject padding after search_from.
 
-        offset = search_from
-        while offset < len(self.data):
-            if self.data[offset] != 0:
-                offset += 1
-                continue
+        Prefer an optional pad_marker signature (e.g. the 8-byte trailer before the
+        real zero run). Fall back to find_pattern on a min_size 0x00 signature.
+        Always verifies a contiguous zero run of at least min_size (CRC excluded).
+        """
+        if search_from is None:
+            window = search_window if search_window is not None else 0x800
+            search_from = max(0, len(self.data) - window)
 
-            run_end = offset
-            while run_end < len(self.data) and self.data[run_end] == 0:
-                run_end += 1
-            run_len = run_end - offset
-            if run_len >= min_size and run_len > best_len:
-                best_start = offset
-                best_len = run_len
-            offset = run_end
-
-        if best_start is None:
+        search_end = max(search_from, len(self.data) - 2)  # keep embedded CRC
+        if search_end - search_from < min_size:
             raise Exception(
-                f"No zero padding >= {min_size} bytes found in last 0x{search_window:X} bytes"
+                f"No room for {min_size}-byte zero padding after 0x{search_from:X} "
+                f"(end=0x{search_end:X})"
             )
-        return best_start
+
+        pad_ofs: Optional[int] = None
+        if pad_marker:
+            try:
+                marker_ofs = find_pattern(self.data, pad_marker, start=search_from)
+                pad_ofs = marker_ofs + len(pad_marker)
+            except SignatureException:
+                pad_ofs = None
+
+        if pad_ofs is None:
+            zero_sig = [0x00] * min_size
+            try:
+                pad_ofs = find_pattern(self.data, zero_sig, start=search_from)
+            except SignatureException as exc:
+                raise Exception(
+                    f"No zero padding signature ({min_size} x 00) found after 0x{search_from:X}"
+                ) from exc
+
+        if pad_ofs + min_size > search_end:
+            raise Exception(
+                f"Zero padding @0x{pad_ofs:X} overlaps CRC / end of firmware"
+            )
+
+        run_end = pad_ofs
+        while run_end < search_end and self.data[run_end] == 0:
+            run_end += 1
+        if run_end - pad_ofs < min_size:
+            raise Exception(
+                f"Zero padding @0x{pad_ofs:X} only {run_end - pad_ofs} bytes "
+                f"(need {min_size})"
+            )
+
+        return pad_ofs
 
     def _resolve_speed_padding_sites(
         self,
@@ -277,6 +308,8 @@ class LeqiSpeedPatcher(CoreN32Patcher):
         hijack_size: int,
         output_ptr_ldr_offset: int,
         min_padding_size: int,
+        inject_search_from: Optional[int] = None,
+        pad_marker: Optional[List[int]] = None,
     ) -> None:
         if self._hijack_offset is not None:
             assert self._inject_offset is not None
@@ -295,7 +328,11 @@ class LeqiSpeedPatcher(CoreN32Patcher):
         self._hijack_offset = sig_ofs
         self._return_address = sig_ofs + len(anchor)
         self._output_ptr = self._read_ldr_pc_literal(sig_ofs + output_ptr_ldr_offset)
-        self._inject_offset = self._find_tail_zero_padding(min_padding_size)
+        self._inject_offset = self._find_tail_zero_padding(
+            min_padding_size,
+            search_from=inject_search_from,
+            pad_marker=pad_marker,
+        )
 
     def _apply_bw_hijack(
         self,
@@ -339,14 +376,46 @@ class LeqiSpeedPatcher(CoreN32Patcher):
         strh {speed_reg}, [{ptr_reg}]
         b.w {hex(return_address)}
         """
+        # Note: [pc, #4] is a placeholder; _assemble_with_literal_pool patches the
+        # immediate so the appended .word lands at the correct PC-relative address.
         return asm_code
 
     def _assemble_with_literal_pool(
         self, asm_code: str, inject_offset: int, literal_value: int
     ) -> bytes:
-        """Assemble inject block and append a 4-byte literal pool word."""
-        code_bytes = self.assembly(asm_code, inject_offset)
-        return code_bytes + struct.pack("<I", literal_value)
+        """
+        Assemble inject block and append a 4-byte literal pool word.
+
+        Epilogue is always: ldr (2) + strh (2) + b.w (4). The ldr imm is rewritten
+        so PC-relative addressing hits the literal after optional alignment padding.
+        """
+        code_bytes = bytearray(self.assembly(asm_code, inject_offset))
+        if len(code_bytes) < 8:
+            raise Exception("Inject block too short for ldr/strh/b.w epilogue")
+
+        ldr_at = inject_offset + len(code_bytes) - 8
+        pc = (ldr_at + 4) & ~3
+        code_end = inject_offset + len(code_bytes)
+        lit_addr = (code_end + 3) & ~3
+        if lit_addr < code_end:
+            lit_addr += 4
+        imm = lit_addr - pc
+        if imm < 0 or imm > 1020 or imm % 4 != 0:
+            raise Exception(
+                f"Cannot place literal pool: ldr@0x{ldr_at:X} pc=0x{pc:X} "
+                f"lit=0x{lit_addr:X} imm={imm}"
+            )
+
+        old_ldr = code_bytes[-8:-6]
+        # Thumb T1: ldr Rt, [pc, #imm8*4]  ->  01001ttt iiiiiiii
+        if (old_ldr[1] & 0xF8) != 0x48:
+            raise Exception(
+                f"Expected Thumb ldr [pc] before strh/b.w, found {old_ldr.hex()}"
+            )
+        rt = old_ldr[1] & 0x07
+        code_bytes[-8:-6] = bytes([imm // 4, 0x48 | rt])
+        pad = lit_addr - code_end
+        return bytes(code_bytes) + (b"\x00" * pad) + struct.pack("<I", literal_value)
 
 
 class LeqiPaddingSpeedPatcher(LeqiSpeedPatcher):
@@ -355,24 +424,41 @@ class LeqiPaddingSpeedPatcher(LeqiSpeedPatcher):
 
     Hijacks a 4-byte instruction run with b.w into tail zero padding. Hijack,
     return, output pointer, and inject sites are resolved via pattern matching.
+
+    Zero-region layout after SIG_INJECT_PAD_MARKER:
+      [margin][inject block][margin]
+    where margin = PADDING_SAFETY_MARGIN.
     """
 
     SIG_SPEED_CALC_ANCHOR: List[int]
     HIJACK_SIZE: int = 4
     OUTPUT_PTR_LDR_OFFSET: int
-    MIN_PADDING_SIZE: int = 64
-    TAIL_SEARCH_WINDOW: int = 0x800
+    # Leading/trailing free zeros around the inject block inside the zero run.
+    PADDING_SAFETY_MARGIN: int = 16
+    # Don't search for inject padding before this offset (keeps us out of code/data).
+    INJECT_SEARCH_START: int = 0xA000
+    # Trailer immediately before the real zero-padding run (mi6 / mi6lite).
+    SIG_INJECT_PAD_MARKER: List[int] = [
+        0x21, 0x3B, 0xB0, 0x17, 0xFD, 0x63, 0x69, 0x34,
+    ]
 
     def _locate_patch_offsets(self) -> None:
         try:
+            # Provisional: leading margin only; full size checked after assemble.
+            provisional = self.PADDING_SAFETY_MARGIN
             self._resolve_speed_padding_sites(
                 self.SIG_SPEED_CALC_ANCHOR,
                 self.HIJACK_SIZE,
                 self.OUTPUT_PTR_LDR_OFFSET,
-                self.MIN_PADDING_SIZE,
+                provisional,
+                inject_search_from=self.INJECT_SEARCH_START,
+                pad_marker=self.SIG_INJECT_PAD_MARKER,
             )
         except SignatureException as exc:
             raise Exception("Could not find speed calc signature for patching") from exc
+        assert self._inject_offset is not None
+        # Place the block after a leading safety margin inside the zero run.
+        self._inject_offset += self.PADDING_SAFETY_MARGIN
 
     def _apply_hijack_patch(self) -> Tuple[str, str, str, str]:
         assert self._hijack_offset is not None
@@ -383,12 +469,27 @@ class LeqiPaddingSpeedPatcher(LeqiSpeedPatcher):
             self.SIG_SPEED_CALC_ANCHOR[:self.HIJACK_SIZE],
         )
 
+    def _required_padding_size(self, patch_bytes: bytes) -> int:
+        """Zeros needed from inject offset: patch + trailing safety margin."""
+        return len(patch_bytes) + self.PADDING_SAFETY_MARGIN
+
     def _verify_inject_site(self, patch_bytes: bytes) -> None:
+        """Require zeros of (patch + trailing margin) starting at the inject site."""
         assert self._inject_offset is not None
-        self._verify_zero_padding(
-            self._inject_offset,
-            max(len(patch_bytes), self.MIN_PADDING_SIZE),
-        )
+        need = self._required_padding_size(patch_bytes)
+        zero_sig = [0x00] * need
+        try:
+            found = find_pattern(self.data, zero_sig, start=self._inject_offset)
+        except SignatureException as exc:
+            raise Exception(
+                f"Inject site @0x{self._inject_offset:X} lacks {need}-byte zero padding "
+                f"(patch={len(patch_bytes)} + margin={self.PADDING_SAFETY_MARGIN})"
+            ) from exc
+        if found != self._inject_offset:
+            raise Exception(
+                f"Inject site @0x{self._inject_offset:X} is not zero padding "
+                f"({need} bytes required; next zero run @0x{found:X})"
+            )
 
     def _assemble_inject_block(self, asm_code: str) -> bytes:
         assert self._inject_offset is not None

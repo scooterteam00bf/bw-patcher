@@ -20,13 +20,15 @@ class Mi6litePatcher(LeqiPaddingSpeedPatcher):
 
     Hijacks the speed-calc instructions with b.w into tail zero padding.
     Base pointer in r1, speed value in r0.
+
+    Region bypass supports two revisions:
+      V1: cmp/beq tree with movs #0xcf / movw #0x101
+      V2: if-else with movs #0xdc / movw #0x113
     """
 
-    FIRMWARE_SIZE = 0xB000  # Fallback only; real size is read from the EU1 header (see
-                             # docs/20-dynamic-firmware-size-detection.md)
+    FIRMWARE_SIZE = 0xB000  # Fallback only; real size is read from the EU1 header
 
-    # UART cmd 0x21 telemetry path (FUN_0000270c): ldrb r0,[r1,#5] * 10 -> strh.
-    # Hijacked with b.w into tail padding for mode-aware SLD/SLS/SLP limits.
+    # UART cmd 0x21 telemetry path: ldrb r0,[r1,#5] * 10 -> strh.
     SIG_SPEED_CALC_ANCHOR = [
         0x48, 0x79, 0x54, 0x49,
         0x00, 0xEB, 0x80, 0x00,
@@ -34,13 +36,9 @@ class Mi6litePatcher(LeqiPaddingSpeedPatcher):
         0x08, 0x80,
     ]
     OUTPUT_PTR_LDR_OFFSET = 2
-    # Skip 8 bytes of non-zero tail metadata (e.g. 0xAC40) before inject block.
-    INJECT_PADDING_OFFSET = 8
 
-    # UART cmd 0x21 regional cap tree in FUN_0000270c (~0x3226, jump-table dispatch).
-    # Stock selects EU (movs #0xcf / 20.7 km/h) or GL (movw #0x101 / 25.7 km/h) and
-    # stores the value to motor config struct field +0x28 via strh r1,[r7].
-    SIG_REGION_LIMIT_ANCHOR: List[Optional[int]] = [
+    # V1: regional cap tree (~0x3226) with EU #0xcf / GL #0x101.
+    SIG_REGION_LIMIT_ANCHOR_V1: List[Optional[int]] = [
         0x67, 0x4F,
         None, None, None, None, None, None,
         0xD1, 0x18, 0x0B, 0xD0, 0x01, 0x29, 0x0C, 0xD1, 0x06, 0xE0,
@@ -48,34 +46,53 @@ class Mi6litePatcher(LeqiPaddingSpeedPatcher):
         0x05, 0xD1, 0x01, 0xE0, 0xCF, 0x21, 0x01, 0xE0, 0x40, 0xF2,
         0x01, 0x11, 0x39, 0x80,
     ]
+    # Keep old name for tests that reference it.
+    SIG_REGION_LIMIT_ANCHOR = SIG_REGION_LIMIT_ANCHOR_V1
 
-    # v2 reference: three surgical edits relative to SIG_REGION_LIMIT_ANCHOR.
-    REGION_CMP_BEQ_OFFSET = 4       # beq #EU_path -> b #EU_path
-    REGION_SKIP_BRANCH_OFFSET = 0x22  # b #store -> nop (fall through to movw)
-    REGION_MOVW_IMM_OFFSET = 0x26     # movw #0x101 -> #REGION_LIMIT_VALUE
+    REGION_CMP_BEQ_OFFSET = 4
+    REGION_SKIP_BRANCH_OFFSET_V1 = 0x22
+    REGION_MOVW_IMM_OFFSET_V1 = 0x26
 
     REGION_CMP_BEQ_STOCK = bytes([0x0C, 0xD0])
     REGION_CMP_BEQ_PATCH = bytes([0x0C, 0xE0])
     REGION_SKIP_BRANCH_STOCK = bytes([0x01, 0xE0])
     REGION_SKIP_BRANCH_PATCH = bytes([0x00, 0xBF])
-    REGION_MOVW_IMM_STOCK = 0x01
+    REGION_MOVW_IMM_STOCK_V1 = 0x01
     REGION_MOVW_IMM_PATCH = 0x5E
+
+    # V2: movs r1,#0xdc; b store; movw r1,#0x113; strh r1,[r2]
+    SIG_REGION_LIMIT_ANCHOR_V2 = [
+        0xDC, 0x21, 0x01, 0xE0, 0x40, 0xF2, 0x13, 0x11, 0x11, 0x80,
+    ]
+    REGION_SKIP_BRANCH_OFFSET_V2 = 2
+    REGION_MOVW_IMM_OFFSET_V2 = 6
+    REGION_MOVW_IMM_STOCK_V2 = 0x13
 
     def __init__(self, data: bytes):
         super().__init__(data)
         self._region_limit_sig_ofs: Optional[int] = None
+        self._region_variant: Optional[str] = None
 
-    def _resolve_region_limit_anchor(self) -> int:
+    def _resolve_region_limit_anchor(self) -> Tuple[int, str]:
         if self._region_limit_sig_ofs is not None:
-            return self._region_limit_sig_ofs
+            assert self._region_variant is not None
+            return self._region_limit_sig_ofs, self._region_variant
 
         try:
-            sig_ofs = find_pattern(self.data, self.SIG_REGION_LIMIT_ANCHOR)
+            sig_ofs = find_pattern(self.data, self.SIG_REGION_LIMIT_ANCHOR_V1)
+            self._region_limit_sig_ofs = sig_ofs
+            self._region_variant = "v1"
+            return sig_ofs, "v1"
+        except SignatureException:
+            pass
+
+        try:
+            sig_ofs = find_pattern(self.data, self.SIG_REGION_LIMIT_ANCHOR_V2)
+            self._region_limit_sig_ofs = sig_ofs
+            self._region_variant = "v2"
+            return sig_ofs, "v2"
         except SignatureException:
             raise SignatureException("region limit anchor")
-
-        self._region_limit_sig_ofs = sig_ofs
-        return sig_ofs
 
     def _patch_site(
         self,
@@ -97,30 +114,46 @@ class Mi6litePatcher(LeqiPaddingSpeedPatcher):
     def _apply_region_limit(self) -> List[Tuple[str, str, str, str]]:
         """Force REGION_LIMIT_VALUE (35 km/h) for all region IDs in UART cmd 0x21 path."""
         try:
-            sig_ofs = self._resolve_region_limit_anchor()
+            sig_ofs, variant = self._resolve_region_limit_anchor()
         except SignatureException:
             return []
 
-        sites = [
-            (
-                "region_limit_bypass",
-                sig_ofs + self.REGION_CMP_BEQ_OFFSET,
-                self.REGION_CMP_BEQ_STOCK,
-                self.REGION_CMP_BEQ_PATCH,
-            ),
-            (
-                "region_limit_nop",
-                sig_ofs + self.REGION_SKIP_BRANCH_OFFSET,
-                self.REGION_SKIP_BRANCH_STOCK,
-                self.REGION_SKIP_BRANCH_PATCH,
-            ),
-            (
-                "region_limit_movw",
-                sig_ofs + self.REGION_MOVW_IMM_OFFSET,
-                bytes([self.REGION_MOVW_IMM_STOCK]),
-                bytes([self.REGION_MOVW_IMM_PATCH]),
-            ),
-        ]
+        if variant == "v1":
+            sites = [
+                (
+                    "region_limit_bypass",
+                    sig_ofs + self.REGION_CMP_BEQ_OFFSET,
+                    self.REGION_CMP_BEQ_STOCK,
+                    self.REGION_CMP_BEQ_PATCH,
+                ),
+                (
+                    "region_limit_nop",
+                    sig_ofs + self.REGION_SKIP_BRANCH_OFFSET_V1,
+                    self.REGION_SKIP_BRANCH_STOCK,
+                    self.REGION_SKIP_BRANCH_PATCH,
+                ),
+                (
+                    "region_limit_movw",
+                    sig_ofs + self.REGION_MOVW_IMM_OFFSET_V1,
+                    bytes([self.REGION_MOVW_IMM_STOCK_V1]),
+                    bytes([self.REGION_MOVW_IMM_PATCH]),
+                ),
+            ]
+        else:
+            sites = [
+                (
+                    "region_limit_nop",
+                    sig_ofs + self.REGION_SKIP_BRANCH_OFFSET_V2,
+                    self.REGION_SKIP_BRANCH_STOCK,
+                    self.REGION_SKIP_BRANCH_PATCH,
+                ),
+                (
+                    "region_limit_movw",
+                    sig_ofs + self.REGION_MOVW_IMM_OFFSET_V2,
+                    bytes([self.REGION_MOVW_IMM_STOCK_V2]),
+                    bytes([self.REGION_MOVW_IMM_PATCH]),
+                ),
+            ]
 
         results: List[Tuple[str, str, str, str]] = []
         for name, offset, stock, post in sites:
@@ -131,19 +164,6 @@ class Mi6litePatcher(LeqiPaddingSpeedPatcher):
 
     def _speed_limit_fix(self) -> List[Tuple[str, str, str, str]]:
         return self._apply_region_limit()
-
-    def _locate_patch_offsets(self) -> None:
-        try:
-            self._resolve_speed_padding_sites(
-                self.SIG_SPEED_CALC_ANCHOR,
-                self.HIJACK_SIZE,
-                self.OUTPUT_PTR_LDR_OFFSET,
-                self.MIN_PADDING_SIZE + self.INJECT_PADDING_OFFSET,
-            )
-        except SignatureException as exc:
-            raise Exception("Could not find speed calc signature for patching") from exc
-        assert self._inject_offset is not None
-        self._inject_offset += self.INJECT_PADDING_OFFSET
 
     def _build_speed_logic_asm(self) -> str:
         assert self._return_address is not None
