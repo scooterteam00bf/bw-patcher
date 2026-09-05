@@ -190,13 +190,17 @@ class Mi6Patcher(LeqiPaddingSpeedPatcher):
         assert self._return_address is not None
         assert self._output_ptr is not None
         if self._fw_variant == "v2":
+            # r1 is live across the hijack: post-return packet builder does
+            # `strh <len>, [r1]` at ~0x2ac6. Clobbering it with mode caused
+            # stores to absolute addresses 1/2/3 → HardFault → err 10/35 loop.
+            # r3 is redefined before use after return, so it is safe here.
             reload_asm = """
             ldrb.w r0, [ip, #5]
-            ldrb.w r1, [ip, #2]
+            ldrb.w r3, [ip, #2]
             """
             return self._build_padding_speed_logic_asm(
                 reload_asm=reload_asm,
-                mode_reg="r1",
+                mode_reg="r3",
                 speed_reg="r0",
                 ptr_reg="r2",
                 return_address=self._return_address,
